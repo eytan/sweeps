@@ -1,0 +1,58 @@
+description: MNIST MLP hyperparameter optimization benchmark
+
+# Training script to run
+program: train_mnist_mlp.py
+
+# Project this sweep is part of
+project: sweeps-mnist-benchmark
+
+# Method: will be specified when creating sweep (bayes or ax)
+# This config serves as a template for the benchmark script
+method: bayes
+
+# Metric to optimize
+metric:
+  name: val_accuracy
+  goal: maximize
+
+# Parameter space to search
+parameters:
+  # Log-scale continuous parameter for learning rate
+  learning_rate:
+    min: 0.0001
+    max: 0.1
+    distribution: log_uniform_values
+
+  # Continuous parameter for weight decay (L2 regularization)
+  weight_decay:
+    min: 0.0
+    max: 0.01
+
+  # Continuous parameter for dropout probability
+  dropout:
+    min: 0.0
+    max: 0.5
+
+  # Continuous parameter for SGD momentum
+  momentum:
+    min: 0.0
+    max: 0.9
+
+  # Integer parameter for number of hidden units per layer
+  hidden_units:
+    min: 32
+    max: 512
+
+  # Integer parameter for number of hidden layers
+  num_layers:
+    min: 1
+    max: 5
+
+  # Integer parameter for batch size
+  batch_size:
+    min: 16
+    max: 256
+
+  # Fixed parameters (not optimized)
+  epochs:
+    value: 1
