@@ -57,3 +57,11 @@ parameters:
 # - Running trials contribute as pending observations
 # - No manual imputation needed - Ax handles incomplete data natively
 # - Supports sophisticated Bayesian optimization strategies
+#
+# For multi-objective optimization with multiple goals, see sweep-ax-moo.yaml
+# MOO uses 'metrics' (plural) instead of 'metric' (singular)
+#
+# Outcome constraints can be added with metric_constraints:
+# metric_constraints:
+#   - "latency <= 100"
+#   - "memory_usage <= 512"

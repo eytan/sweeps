@@ -198,9 +198,13 @@ def _create_ax_client_from_config(
     """
     Create and configure an Ax Client based on sweep config.
 
+    Supports both single-objective optimization (using 'metric') and
+    multi-objective optimization (using 'metrics').
+
     Args:
         config: Sweep configuration
         params: HyperParameterSet from config["parameters"]
+        random_seed: Random seed for reproducibility
 
     Returns:
         Configured Client ready for trial generation
@@ -233,19 +237,78 @@ def _create_ax_client_from_config(
         description=config.get("description"),
     )
 
-    # Configure optimization
-    metric_name = config["metric"]["name"]
-    goal = config["metric"]["goal"]
+    # Configure optimization based on single vs multi-objective
+    is_moo = _is_moo_config(config)
 
-    # Ax uses objective string format:
-    # - "-metric_name" for minimization (negative to convert max to min)
-    # - "metric_name" for maximization
-    if goal == "minimize":
-        objective = f"-{metric_name}"
-    else:  # maximize
-        objective = metric_name
+    if is_moo:
+        # Multi-objective optimization
+        # Ax Client uses comma-separated objective string for MOO
+        # Format: "-metric1, metric2" (negative for minimize, positive for maximize)
+        objective_parts = []
+        for m in config["metrics"]:
+            if m["goal"] == "minimize":
+                objective_parts.append(f"-{m['name']}")
+            else:  # maximize
+                objective_parts.append(m["name"])
 
-    client.configure_optimization(objective=objective)
+        objective = ", ".join(objective_parts)
+
+        # Get outcome constraints if specified
+        outcome_constraints = config.get("metric_constraints")
+
+        client.configure_optimization(
+            objective=objective,
+            outcome_constraints=outcome_constraints,
+        )
+
+        # Set objective thresholds if specified (for hypervolume calculation)
+        # This requires accessing the experiment's optimization config directly
+        if any(m.get("threshold") is not None for m in config["metrics"]):
+            try:
+                from ax.core.optimization_config import MultiObjectiveOptimizationConfig
+                from ax.core.objective import Objective
+                from ax.core.types import TModelPredictArm
+
+                opt_config = client._experiment.optimization_config
+                if isinstance(opt_config, MultiObjectiveOptimizationConfig):
+                    # Set thresholds on objectives
+                    for m in config["metrics"]:
+                        threshold = m.get("threshold")
+                        if threshold is not None:
+                            metric_name = m["name"]
+                            for obj_threshold in opt_config.objective_thresholds:
+                                if obj_threshold.metric.name == metric_name:
+                                    obj_threshold.bound = threshold
+                                    break
+            except Exception as e:
+                logger.warning(f"Could not set objective thresholds: {e}")
+
+        logger.debug(
+            f"Configured Ax experiment with MOO objective: {objective} "
+            f"and {len(outcome_constraints or [])} constraints"
+        )
+    else:
+        # Single-objective optimization
+        metric_name = config["metric"]["name"]
+        goal = config["metric"]["goal"]
+
+        # Ax uses objective string format:
+        # - "-metric_name" for minimization (negative to convert max to min)
+        # - "metric_name" for maximization
+        if goal == "minimize":
+            objective = f"-{metric_name}"
+        else:  # maximize
+            objective = metric_name
+
+        # Get outcome constraints if specified (also supported for single-objective)
+        outcome_constraints = config.get("metric_constraints")
+
+        client.configure_optimization(
+            objective=objective,
+            outcome_constraints=outcome_constraints,
+        )
+
+        logger.debug(f"Configured Ax experiment with objective: {objective}")
 
     # Configure generation strategy (default to "fast")
     # "fast" uses Bayesian optimization with good defaults
@@ -254,8 +317,6 @@ def _create_ax_client_from_config(
         initialization_random_seed=random_seed,
         initialize_with_center=False,
     )
-
-    logger.debug(f"Configured Ax experiment with objective: {objective}")
 
     return client
 
@@ -335,12 +396,70 @@ def _extract_latest_metric_from_run(run: SweepRun, metric_name: str) -> float:
     return history[-1]
 
 
+def _extract_metrics_from_run(
+    run: SweepRun, metric_names: List[str]
+) -> dict:
+    """
+    Extract multiple metric values from a completed run.
+
+    Uses summary_metric to get the final (summary) metric value for each metric.
+
+    Args:
+        run: SweepRun with metric data
+        metric_names: List of metric names to extract
+
+    Returns:
+        Dict mapping metric name to value
+
+    Raises:
+        ValueError: If any metric cannot be extracted
+    """
+    metrics = {}
+    missing = []
+
+    for metric_name in metric_names:
+        try:
+            metrics[metric_name] = run.summary_metric(metric_name)
+        except (KeyError, ValueError):
+            missing.append(metric_name)
+
+    if missing:
+        raise ValueError(f"Cannot extract metrics {missing} from run")
+
+    return metrics
+
+
+def _extract_latest_metrics_from_run(
+    run: SweepRun, metric_names: List[str]
+) -> dict:
+    """
+    Extract the latest values for multiple metrics from a running trial.
+
+    Args:
+        run: SweepRun with history
+        metric_names: List of metric names to extract
+
+    Returns:
+        Dict mapping metric name to latest value (only includes metrics with data)
+    """
+    metrics = {}
+
+    for metric_name in metric_names:
+        try:
+            history = run.metric_history(metric_name, filter_invalid=True)
+            if len(history) > 0:
+                metrics[metric_name] = history[-1]
+        except (KeyError, ValueError):
+            pass  # Skip metrics without data
+
+    return metrics
+
+
 def _attach_historical_trials_to_client(
     client: Client,
     runs: List[SweepRun],
     params: HyperParameterSet,
-    metric_name: str,
-    goal: str,
+    metric_names: List[str],
 ) -> dict:
     """
     Attach historical trial data from runs to the Ax Client using native Ax trial statuses.
@@ -363,8 +482,7 @@ def _attach_historical_trials_to_client(
         client: Configured Ax Client
         runs: Historical sweep runs
         params: HyperParameterSet for parameter extraction
-        metric_name: Name of optimization metric
-        goal: "minimize" or "maximize"
+        metric_names: List of metric names to extract (single for SOO, multiple for MOO)
 
     Returns:
         Dict with statistics: {
@@ -383,6 +501,8 @@ def _attach_historical_trials_to_client(
         "skipped": 0,
     }
 
+    is_moo = len(metric_names) > 1
+
     for run in runs:
         # Extract parameters from run config
         try:
@@ -397,22 +517,26 @@ def _attach_historical_trials_to_client(
 
         # Handle based on run state using Ax-native trial status
         if run.state == RunState.finished:
-            # Finished run - try to extract metric and complete
+            # Finished run - try to extract metric(s) and complete
             try:
-                metric_value = _extract_metric_from_run(run, metric_name)
+                if is_moo:
+                    # Multi-objective: extract all metrics
+                    metric_values = _extract_metrics_from_run(run, metric_names)
+                else:
+                    # Single-objective: extract single metric
+                    metric_value = _extract_metric_from_run(run, metric_names[0])
+                    metric_values = {metric_names[0]: metric_value}
 
                 # Attach data and complete trial
                 # complete_trial will automatically mark as COMPLETED or FAILED
                 # based on whether metric data is present
-                client.complete_trial(
-                    trial_index=trial_index, raw_data={metric_name: metric_value}
-                )
+                client.complete_trial(trial_index=trial_index, raw_data=metric_values)
                 stats["completed"] += 1
 
             except ValueError as e:
                 # No valid metric - mark as failed
                 logger.warning(
-                    f"Trial {trial_index} missing metric, marking as FAILED: {e}"
+                    f"Trial {trial_index} missing metric(s), marking as FAILED: {e}"
                 )
                 client.mark_trial_failed(
                     trial_index=trial_index, failed_reason=f"Missing metric: {e}"
@@ -430,12 +554,32 @@ def _attach_historical_trials_to_client(
         elif run.state == RunState.running:
             # Running trial - try to attach partial data if available
             try:
-                # Get latest metric value if available
-                metric_value = _extract_latest_metric_from_run(run, metric_name)
-                client.attach_data(
-                    trial_index=trial_index, raw_data={metric_name: metric_value}
-                )
-                logger.debug(f"Attached partial data for running trial {trial_index}")
+                if is_moo:
+                    # Multi-objective: get latest values for all available metrics
+                    metric_values = _extract_latest_metrics_from_run(run, metric_names)
+                    if metric_values:
+                        client.attach_data(
+                            trial_index=trial_index, raw_data=metric_values
+                        )
+                        logger.debug(
+                            f"Attached partial data for running trial {trial_index}"
+                        )
+                    else:
+                        logger.debug(
+                            f"Trial {trial_index} is running but has no data yet"
+                        )
+                else:
+                    # Single-objective: get latest metric value if available
+                    metric_value = _extract_latest_metric_from_run(
+                        run, metric_names[0]
+                    )
+                    client.attach_data(
+                        trial_index=trial_index,
+                        raw_data={metric_names[0]: metric_value},
+                    )
+                    logger.debug(
+                        f"Attached partial data for running trial {trial_index}"
+                    )
             except ValueError:
                 # No data yet - leave trial as RUNNING
                 # Ax will treat this as a pending observation
@@ -502,13 +646,27 @@ def _ax_params_to_sweep_config(ax_params: dict, params: HyperParameterSet) -> di
     return params.to_config()
 
 
+def _is_moo_config(config: dict) -> bool:
+    """Check if config is for multi-objective optimization.
+
+    Args:
+        config: Sweep configuration dict
+
+    Returns:
+        True if config uses 'metrics' (MOO), False if uses 'metric' (single-objective)
+    """
+    return "metrics" in config
+
+
 def _validate_config(config: dict) -> None:
     """Validate sweep config for ax method.
 
     Checks:
     - method == "ax"
-    - "metric" section exists with "name" and "goal"
+    - Either "metric" (single-objective) OR "metrics" (multi-objective) exists
     - "parameters" section exists and is non-empty
+    - early_terminate is not used with multi-objective optimization
+    - metric_constraints format is valid
 
     Args:
         config: Sweep configuration dict
@@ -525,22 +683,68 @@ def _validate_config(config: dict) -> None:
             f"Expected method='ax', got method='{config['method']}'"
         )
 
-    if "metric" not in config:
-        raise ValueError('Ax Bayesian search requires "metric" section in config')
+    # Check mutual exclusion of metric and metrics
+    has_metric = "metric" in config
+    has_metrics = "metrics" in config
 
-    if "name" not in config["metric"]:
-        raise ValueError('Metric section must contain "name" field')
-
-    if "goal" not in config["metric"]:
+    if has_metric and has_metrics:
         raise ValueError(
-            'Metric section must contain "goal" field (minimize or maximize)'
+            "Cannot specify both 'metric' (single-objective) and 'metrics' "
+            "(multi-objective) in the same config."
         )
 
-    if config["metric"]["goal"] not in ["minimize", "maximize"]:
+    if not has_metric and not has_metrics:
         raise ValueError(
-            f"Metric goal must be 'minimize' or 'maximize', "
-            f"got '{config['metric']['goal']}'"
+            'Ax Bayesian search requires either "metric" (single-objective) '
+            'or "metrics" (multi-objective) section in config'
         )
+
+    # Validate single-objective metric
+    if has_metric:
+        if "name" not in config["metric"]:
+            raise ValueError('Metric section must contain "name" field')
+
+        if "goal" not in config["metric"]:
+            raise ValueError(
+                'Metric section must contain "goal" field (minimize or maximize)'
+            )
+
+        if config["metric"]["goal"] not in ["minimize", "maximize"]:
+            raise ValueError(
+                f"Metric goal must be 'minimize' or 'maximize', "
+                f"got '{config['metric']['goal']}'"
+            )
+
+    # Validate multi-objective metrics
+    if has_metrics:
+        metrics = config["metrics"]
+        if not isinstance(metrics, list):
+            raise ValueError(f"metrics must be a list, got {type(metrics)}")
+
+        if len(metrics) < 2:
+            raise ValueError(
+                "metrics must contain at least 2 objectives for multi-objective optimization"
+            )
+
+        for i, m in enumerate(metrics):
+            if not isinstance(m, dict):
+                raise ValueError(f"metrics[{i}] must be a dict")
+            if "name" not in m:
+                raise ValueError(f'metrics[{i}] must contain "name" field')
+            if "goal" not in m:
+                raise ValueError(f'metrics[{i}] must contain "goal" field')
+            if m["goal"] not in ["minimize", "maximize"]:
+                raise ValueError(
+                    f"metrics[{i}]['goal'] must be 'minimize' or 'maximize', "
+                    f"got '{m['goal']}'"
+                )
+
+        # Check for early_terminate + MOO conflict
+        if "early_terminate" in config:
+            raise ValueError(
+                "early_terminate is not supported with multi-objective optimization. "
+                "Please remove early_terminate or use single-objective optimization."
+            )
 
     if "parameters" not in config:
         raise ValueError('Ax Bayesian search requires "parameters" section in config')
@@ -566,6 +770,7 @@ def ax_search_next_runs(
     - Failed trials teach the model what parameter regions to avoid
     - Running trials contribute as pending observations
     - Advanced Bayesian optimization strategies from Meta Research
+    - Multi-objective optimization with Pareto frontier support
 
     Main workflow:
     1. Validate config and extract parameters
@@ -573,24 +778,27 @@ def ax_search_next_runs(
     3. Attach historical trial data with native Ax status handling
     4. Generate n new trials using Ax's optimization
     5. Convert Ax parameterizations to SweepRun format
-    6. Return list of SweepRun objects
+    6. For MOO, include Pareto frontier in search_info
+    7. Return list of SweepRun objects
 
     Args:
         runs: List of existing runs in the sweep
         config: Sweep configuration dict or SweepConfig
         validate: Whether to validate config against schema
         n: Number of new runs to generate
+        random_seed: Random seed for reproducibility
         **kwargs: Additional arguments (reserved for future extensions)
 
     Returns:
-        List of n SweepRun objects with suggested configurations
+        List of n SweepRun objects with suggested configurations.
+        For multi-objective optimization, search_info includes 'pareto_frontier'.
 
     Raises:
         ValueError: For invalid config or unsupported parameter types
         ImportError: If ax-platform is not installed
         RuntimeError: If Ax optimization fails
 
-    Example:
+    Example (single-objective):
         >>> config = {
         ...     'method': 'ax',
         ...     'parameters': {
@@ -602,6 +810,18 @@ def ax_search_next_runs(
         >>> suggestions = ax_search_next_runs([], config, n=5)
         >>> len(suggestions)
         5
+
+    Example (multi-objective):
+        >>> config = {
+        ...     'method': 'ax',
+        ...     'parameters': {'learning_rate': {'min': 0.001, 'max': 0.1}},
+        ...     'metrics': [
+        ...         {'name': 'accuracy', 'goal': 'maximize'},
+        ...         {'name': 'latency', 'goal': 'minimize'}
+        ...     ]
+        ... }
+        >>> suggestions = ax_search_next_runs([], config, n=3)
+        >>> # After some runs complete, search_info will contain pareto_frontier
     """
     # 1. Validation
     if validate:
@@ -611,8 +831,13 @@ def ax_search_next_runs(
 
     # 2. Extract configuration
     params = HyperParameterSet.from_config(config["parameters"])
-    metric_name = config["metric"]["name"]
-    goal = config["metric"]["goal"]
+    is_moo = _is_moo_config(config)
+
+    # Get metric names based on single vs multi-objective
+    if is_moo:
+        metric_names = [m["name"] for m in config["metrics"]]
+    else:
+        metric_names = [config["metric"]["name"]]
 
     if len(params.searchable_params) == 0:
         raise ValueError(
@@ -620,9 +845,10 @@ def ax_search_next_runs(
             "At least one non-constant parameter is required for Ax."
         )
 
+    mode_str = "multi-objective" if is_moo else "single-objective"
     logger.info(
-        f"Starting Ax optimization for {len(params.searchable_params)} searchable parameters, "
-        f"{len(runs)} historical runs"
+        f"Starting Ax {mode_str} optimization for {len(params.searchable_params)} "
+        f"searchable parameters, {len(runs)} historical runs"
     )
 
     # 3. Create Ax Client
@@ -636,7 +862,7 @@ def ax_search_next_runs(
         # Suppress Ax's verbose info logging during bulk trial operations
         with _suppress_ax_logging():
             stats = _attach_historical_trials_to_client(
-                client, runs, params, metric_name, goal
+                client, runs, params, metric_names
             )
         logger.info(f"Trial attachment statistics: {stats}")
     else:
@@ -656,7 +882,28 @@ def ax_search_next_runs(
             "Consider checking your parameter ranges and metric data."
         ) from e
 
-    # 6. Convert to SweepRun format
+    # 6. Get Pareto frontier for MOO (if we have completed trials)
+    pareto_frontier = None
+    if is_moo and len(runs) > 0:
+        try:
+            # Get Pareto optimal points from the experiment
+            # Returns list of tuples: (parameters, metrics, trial_index, arm_name)
+            pareto_results = client.get_pareto_frontier(use_model_predictions=False)
+            if pareto_results:
+                pareto_frontier = []
+                for params_dict, metrics_dict, trial_index, arm_name in pareto_results:
+                    pareto_frontier.append({
+                        "trial_index": trial_index,
+                        "arm_name": arm_name,
+                        "parameters": dict(params_dict),
+                        "metrics": dict(metrics_dict),
+                    })
+                logger.debug(f"Found {len(pareto_frontier)} Pareto optimal points")
+        except Exception as e:
+            # Pareto frontier retrieval is optional, don't fail on errors
+            logger.warning(f"Could not retrieve Pareto frontier: {e}")
+
+    # 7. Convert to SweepRun format
     suggested_runs = []
 
     for trial_index, ax_params in next_parameterizations.items():
@@ -668,6 +915,13 @@ def ax_search_next_runs(
             "method": "ax",
             "ax_trial_index": trial_index,
         }
+
+        # Add MOO-specific info
+        if is_moo:
+            search_info["is_multi_objective"] = True
+            search_info["objective_names"] = metric_names
+            if pareto_frontier is not None:
+                search_info["pareto_frontier"] = pareto_frontier
 
         suggested_runs.append(SweepRun(config=sweep_config, search_info=search_info))
 
