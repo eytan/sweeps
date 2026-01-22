@@ -658,6 +658,46 @@ def _is_moo_config(config: dict) -> bool:
     return "metrics" in config
 
 
+def _parse_constraint_metric_names(metric_constraints: List[str]) -> List[str]:
+    """Extract metric names from constraint expressions.
+
+    Ax only supports <= and >= operators for outcome constraints.
+
+    Args:
+        metric_constraints: List of constraint strings like "g1 <= 0", "accuracy >= 0.9"
+
+    Returns:
+        List of metric names extracted from constraints
+
+    Raises:
+        ValueError: If constraint uses unsupported operator (<, >, ==)
+
+    Examples:
+        >>> _parse_constraint_metric_names(["g1 <= 0", "g2 <= 0"])
+        ['g1', 'g2']
+        >>> _parse_constraint_metric_names(["loss <= 1.0", "accuracy >= 0.9"])
+        ['loss', 'accuracy']
+    """
+    metric_names = []
+    for constraint in metric_constraints:
+        # Ax only supports <= and >= operators
+        if "<=" in constraint:
+            metric_name = constraint.split("<=")[0].strip()
+            if metric_name:
+                metric_names.append(metric_name)
+        elif ">=" in constraint:
+            metric_name = constraint.split(">=")[0].strip()
+            if metric_name:
+                metric_names.append(metric_name)
+        else:
+            raise ValueError(
+                f"Invalid constraint format: '{constraint}'. "
+                f"Ax only supports '<=' and '>=' operators. "
+                f"Use format like 'metric_name <= value' or 'metric_name >= value'."
+            )
+    return metric_names
+
+
 def _validate_config(config: dict) -> None:
     """Validate sweep config for ax method.
 
@@ -838,6 +878,17 @@ def ax_search_next_runs(
         metric_names = [m["name"] for m in config["metrics"]]
     else:
         metric_names = [config["metric"]["name"]]
+
+    # Also include constraint metric names if present
+    # Ax expects all metrics referenced in constraints to be reported
+    if "metric_constraints" in config and config["metric_constraints"]:
+        constraint_metric_names = _parse_constraint_metric_names(
+            config["metric_constraints"]
+        )
+        # Add constraint metrics that aren't already in metric_names
+        for name in constraint_metric_names:
+            if name not in metric_names:
+                metric_names.append(name)
 
     if len(params.searchable_params) == 0:
         raise ValueError(
