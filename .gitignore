@@ -137,3 +137,9 @@ prof/
 result.xml
 wandb/
 data/
+
+# macOS
+.DS_Store
+
+# Claude
+.claude/
