@@ -58,40 +58,14 @@ import numpy as np
 import pandas as pd
 import yaml
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
+from benchmark_utils import convert_to_json_serializable  # noqa: E402
 from sweeps.ax_search import ax_search_next_runs  # noqa: E402
 from sweeps.bayes_search import bayes_search_next_runs  # noqa: E402
 from sweeps.run import RunState, SweepRun  # noqa: E402
 
 warnings.filterwarnings("ignore")
-
-
-def convert_to_json_serializable(obj: Any) -> Any:
-    """Convert numpy types and arrays to native Python types for JSON serialization.
-
-    Args:
-        obj: Object to convert (can be dict, list, numpy array, numpy scalar, etc.)
-
-    Returns:
-        JSON-serializable version of the object
-    """
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, (np.int64, np.int32, np.int16, np.int8)):
-        return int(obj)
-    elif isinstance(obj, (np.float64, np.float32, np.float16)):
-        return float(obj)
-    elif isinstance(obj, np.bool_):
-        return bool(obj)
-    elif isinstance(obj, dict):
-        return {key: convert_to_json_serializable(value) for key, value in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        return [convert_to_json_serializable(item) for item in obj]
-    elif obj is None or isinstance(obj, (bool, int, float, str)):
-        return obj
-    else:
-        return str(obj)
 
 
 class MLPTrainingProblem:

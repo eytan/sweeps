@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
-"""Benchmark comparing Ax MOO vs Sobol baseline on multi-objective test functions.
+"""Benchmark for Ax MOO on multi-objective test functions.
 
 This script evaluates the performance of Ax-based Multi-Objective Bayesian
-Optimization versus a Sobol quasi-random baseline on the WeldedBeam problem.
+Optimization on standard MOO test problems.
 
 The benchmark runs multiple replications with different random seeds to ensure
-statistical robustness and compares:
+statistical robustness and tracks:
 - Hypervolume progression (main MOO performance metric)
 - Final Pareto front quality
 
-Test Problem:
-- WeldedBeam (4D): 2 objectives (cost, deflection), 4 inequality constraints
-
 Usage:
-    # Quick test (10 iterations, 3 replications)
-    python moo_benchmark_synthetic.py --iterations 10 --replications 3
+    # Quick test (10 trials, 3 replications)
+    python moo_benchmark_synthetic.py --trials 10 --replications 3
 
-    # Standard benchmark (50 iterations, 25 replications)
-    python moo_benchmark_synthetic.py --iterations 50 --replications 25
+    # Standard benchmark (50 trials, 25 replications)
+    python moo_benchmark_synthetic.py --trials 50 --replications 25
 
     # Custom initial points
     python moo_benchmark_synthetic.py --init 12
@@ -35,20 +32,19 @@ import json
 import os
 import sys
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 try:
     import torch
-    from torch.quasirandom import SobolEngine
 except ImportError:
     print("Error: torch is required for this benchmark.")
     print("Install with: pip install torch")
     sys.exit(1)
 
-# Add parent directory to path to import sweeps
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+# Add path to import sweeps
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from benchmark_problems import (  # noqa: E402
     MultiObjectiveBoTorchProblem,
@@ -56,6 +52,7 @@ from benchmark_problems import (  # noqa: E402
     list_available_moo_problems,
     MOO_PROBLEM_REGISTRY,
 )
+from benchmark_utils import convert_to_json_serializable  # noqa: E402
 from sweeps.ax_search import ax_search_next_runs  # noqa: E402
 from sweeps.run import RunState, SweepRun  # noqa: E402
 
@@ -63,73 +60,19 @@ from sweeps.run import RunState, SweepRun  # noqa: E402
 warnings.filterwarnings("ignore")
 
 
-def convert_to_json_serializable(obj: Any) -> Any:
-    """Convert numpy types and arrays to native Python types for JSON serialization.
-
-    Args:
-        obj: Object to convert (can be dict, list, numpy array, numpy scalar, etc.)
-
-    Returns:
-        JSON-serializable version of the object
-    """
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, (np.int64, np.int32, np.int16, np.int8)):
-        return int(obj)
-    elif isinstance(obj, (np.float64, np.float32, np.float16)):
-        return float(obj)
-    elif isinstance(obj, np.bool_):
-        return bool(obj)
-    elif isinstance(obj, dict):
-        return {key: convert_to_json_serializable(value) for key, value in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        return [convert_to_json_serializable(item) for item in obj]
-    elif obj is None or isinstance(obj, (bool, int, float, str)):
-        return obj
-    else:
-        # Try to convert to string as fallback
-        return str(obj)
-
-
-def generate_sobol_point(
-    sobol_engine: SobolEngine,
-    bounds: List[Tuple[float, float]],
-) -> Dict[str, float]:
-    """Generate a single point from Sobol sequence.
-
-    Args:
-        sobol_engine: PyTorch SobolEngine instance
-        bounds: List of (lower, upper) bounds for each dimension
-
-    Returns:
-        Dict mapping parameter names to values
-    """
-    # Generate point in [0, 1]^d
-    point = sobol_engine.draw(1).squeeze(0).numpy()
-
-    # Scale to bounds
-    params = {}
-    for i, (lower, upper) in enumerate(bounds):
-        params[f"x{i}"] = float(lower + point[i] * (upper - lower))
-
-    return params
-
-
 def run_moo_replication(
     problem: MultiObjectiveBoTorchProblem,
-    method: str,
-    num_iterations: int,
+    num_trials: int,
     num_init: int,
     random_seed: int,
     verbose: bool = False,
 ) -> Dict[str, Any]:
-    """Run a single MOO replication, tracking hypervolume at each iteration.
+    """Run a single MOO replication, tracking hypervolume at each trial.
 
     Args:
         problem: Multi-objective test problem
-        method: Optimization method ('ax' or 'sobol')
-        num_iterations: Total number of iterations to run
-        num_init: Number of initial Sobol points (only used by 'ax')
+        num_trials: Total number of trials to run
+        num_init: Number of initial points (Ax handles initialization internally)
         random_seed: Random seed for reproducibility
         verbose: Whether to print progress
 
@@ -142,7 +85,6 @@ def run_moo_replication(
             - 'all_X': All parameter values evaluated
             - 'all_feasible': Boolean array of feasibility for each point
             - 'seed': Random seed used
-            - 'method': Method used
     """
     np.random.seed(random_seed)
     torch.manual_seed(random_seed)
@@ -160,37 +102,21 @@ def run_moo_replication(
     objective_names = problem.objective_names
     constraint_names = problem.constraint_names
 
-    # Initialize Sobol engine for baseline or initial points
-    sobol_engine = SobolEngine(dimension=problem.dim, scramble=True, seed=random_seed)
-
-    for trial in range(num_iterations):
+    for trial in range(num_trials):
         if verbose and (trial + 1) % 10 == 0:
-            print(f"    Trial {trial + 1}/{num_iterations}")
+            print(f"    Trial {trial + 1}/{num_trials}")
 
         try:
-            # Generate next suggestion
-            if method == "sobol":
-                # Pure Sobol baseline
-                params = generate_sobol_point(sobol_engine, problem.bounds)
-            elif method == "ax":
-                # Ax MOO with Sobol initialization
-                if trial < num_init:
-                    # Use Sobol for initialization
-                    params = generate_sobol_point(sobol_engine, problem.bounds)
-                else:
-                    # Use Ax MOO for optimization
-                    suggestions = ax_search_next_runs(
-                        runs, config, n=1, random_seed=random_seed
-                    )
-                    if suggestions:
-                        params = {
-                            k: v["value"] for k, v in suggestions[0].config.items()
-                        }
-                    else:
-                        # Fall back to Sobol if Ax fails
-                        params = generate_sobol_point(sobol_engine, problem.bounds)
-            else:
-                raise ValueError(f"Unknown method: {method}")
+            # Generate next suggestion using Ax
+            suggestions = ax_search_next_runs(
+                runs, config, n=1, random_seed=random_seed
+            )
+            if not suggestions:
+                if verbose:
+                    print(f"    Warning: No suggestions at trial {trial}")
+                break
+
+            params = {k: v["value"] for k, v in suggestions[0].config.items()}
 
             # Evaluate objectives and constraints
             result = problem.evaluate(params)
@@ -282,54 +208,49 @@ def run_moo_replication(
         "all_X": X_array.tolist() if len(X_array) > 0 else [],
         "all_feasible": feasible_mask.tolist() if len(feasible_mask) > 0 else [],
         "seed": random_seed,
-        "method": method,
     }
 
 
-def benchmark_moo_methods(
+def benchmark_moo(
     problem: MultiObjectiveBoTorchProblem,
-    methods: List[str],
-    num_iterations: int,
+    num_trials: int,
     num_init: int,
     num_replications: int,
     random_seeds: Optional[List[int]] = None,
 ) -> Dict[str, List[Dict]]:
-    """Run full MOO benchmark across methods and replications.
+    """Run MOO benchmark with Ax across replications.
 
     Args:
         problem: Multi-objective test problem
-        methods: List of methods to compare (e.g., ['ax', 'sobol'])
-        num_iterations: Number of optimization iterations per replication
-        num_init: Number of initial Sobol points for Ax
-        num_replications: Number of replications per method
+        num_trials: Number of optimization trials per replication
+        num_init: Number of initial points for Ax
+        num_replications: Number of replications
         random_seeds: List of random seeds (defaults to range(num_replications))
 
     Returns:
-        Dict mapping method name to list of replication results
+        Dict mapping method name ('ax') to list of replication results
     """
     if random_seeds is None:
         random_seeds = list(range(num_replications))
 
-    results = {method: [] for method in methods}
+    results = {"ax": []}
 
-    for method in methods:
-        print(f"\n  Running {method} on {problem.name}...")
-        for replication_idx, seed in enumerate(random_seeds):
-            replication_result = run_moo_replication(
-                problem=problem,
-                method=method,
-                num_iterations=num_iterations,
-                num_init=num_init,
-                random_seed=seed,
-                verbose=False,
-            )
+    print(f"\n  Running Ax on {problem.name}...")
+    for replication_idx, seed in enumerate(random_seeds):
+        replication_result = run_moo_replication(
+            problem=problem,
+            num_trials=num_trials,
+            num_init=num_init,
+            random_seed=seed,
+            verbose=False,
+        )
 
-            results[method].append(replication_result)
-            final_hv = replication_result["hypervolume_curve"][-1] if replication_result["hypervolume_curve"] else 0.0
-            print(
-                f"    Replication {replication_idx + 1}/{num_replications} (seed={seed}) "
-                f"Final HV: {final_hv:.6f}"
-            )
+        results["ax"].append(replication_result)
+        final_hv = replication_result["hypervolume_curve"][-1] if replication_result["hypervolume_curve"] else 0.0
+        print(
+            f"    Replication {replication_idx + 1}/{num_replications} (seed={seed}) "
+            f"Final HV: {final_hv:.6f}"
+        )
 
     return results
 
@@ -382,7 +303,7 @@ def save_moo_results(
     problem: MultiObjectiveBoTorchProblem,
     results: Dict[str, List[Dict]],
     stats: Dict[str, Dict[str, Any]],
-    num_iterations: int,
+    num_trials: int,
     num_init: int,
     output_dir: str,
 ) -> str:
@@ -392,7 +313,7 @@ def save_moo_results(
         problem: The benchmark problem
         results: Dict mapping method to list of replication results
         stats: Dict mapping method to statistics
-        num_iterations: Number of iterations per replication
+        num_trials: Number of trials per replication
         num_init: Number of initial points
         output_dir: Directory to save results
 
@@ -404,7 +325,7 @@ def save_moo_results(
     detailed_data = {
         "metadata": {
             **convert_to_json_serializable(problem.get_metadata()),
-            "num_iterations": num_iterations,
+            "num_trials": num_trials,
             "num_init": num_init,
             "num_replications": stats[list(stats.keys())[0]]["num_replications"] if stats else 0,
         },
@@ -420,12 +341,12 @@ def save_moo_results(
 
 
 def main():
-    """Run MOO benchmark comparing Ax vs Sobol methods."""
+    """Run MOO benchmark using Ax."""
     # Build choices for --problems argument
     problem_choices = list(MOO_PROBLEM_REGISTRY.keys()) + ["all", "moo"]
 
     parser = argparse.ArgumentParser(
-        description="Benchmark Ax MOO vs Sobol on multi-objective test functions",
+        description="Benchmark Ax MOO on multi-objective test functions",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -437,35 +358,28 @@ def main():
         help="Problems to benchmark (default: dtlz2). Use 'all' for all MOO problems.",
     )
     parser.add_argument(
-        "--iterations",
+        "--trials",
         type=int,
         default=50,
-        help="Number of optimization iterations per replication",
+        help="Number of optimization trials per replication",
     )
     parser.add_argument(
         "--init",
         type=int,
         default=8,
-        help="Number of initial Sobol points for Ax",
+        help="Number of initial points for Ax",
     )
     parser.add_argument(
         "--replications",
         type=int,
         default=25,
-        help="Number of replications per method (for statistical robustness)",
+        help="Number of replications (for statistical robustness)",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
         default="benchmark_results/moo",
         help="Directory to save results",
-    )
-    parser.add_argument(
-        "--methods",
-        type=str,
-        nargs="+",
-        default=["ax", "sobol"],
-        help="Methods to benchmark",
     )
     parser.add_argument(
         "--seed",
@@ -506,13 +420,11 @@ def main():
 
     print("=" * 70)
     print("MULTI-OBJECTIVE OPTIMIZATION BENCHMARK")
-    print("comparing 'ax' (Ax MOO) vs 'sobol' (quasi-random baseline)")
     print("=" * 70)
     print(f"Problems: {', '.join([p.name for p in problems])}")
-    print(f"Iterations per replication: {args.iterations}")
-    print(f"Initial Sobol points: {args.init}")
-    print(f"Replications per method: {args.replications}")
-    print(f"Methods: {', '.join(args.methods)}")
+    print(f"Trials per replication: {args.trials}")
+    print(f"Initial points: {args.init}")
+    print(f"Replications: {args.replications}")
     print(f"Output directory: {args.output_dir}")
     print(f"Random seed: {args.seed}")
     print("=" * 70)
@@ -522,7 +434,6 @@ def main():
     all_stats = {}
 
     for problem in problems:
-        metadata = problem.get_metadata()
         print(f"\n{'=' * 70}")
         print(f"Benchmarking on {problem.name}")
         print(f"  Dimensionality: {problem.dim}D")
@@ -531,10 +442,9 @@ def main():
         print(f"  Reference point: {problem.ref_point}")
         print(f"{'=' * 70}")
 
-        results = benchmark_moo_methods(
+        results = benchmark_moo(
             problem=problem,
-            methods=args.methods,
-            num_iterations=args.iterations,
+            num_trials=args.trials,
             num_init=args.init,
             num_replications=args.replications,
             random_seeds=[args.seed + i for i in range(args.replications)],
@@ -544,7 +454,7 @@ def main():
 
         # Save results for this problem
         save_moo_results(
-            problem, results, stats, args.iterations, args.init, args.output_dir
+            problem, results, stats, args.trials, args.init, args.output_dir
         )
 
         all_results[problem.name] = results
@@ -558,13 +468,10 @@ def main():
     for problem_name in all_results.keys():
         print(f"\n{problem_name}:")
         stats = all_stats[problem_name]
-
-        for method in args.methods:
-            method_stats = stats[method]
-            print(f"\n  {method}:")
-            print(
-                f"    Final Hypervolume: {method_stats['final_hv_mean']:.6f} +/- {method_stats['final_hv_sem']:.6f}"
-            )
+        ax_stats = stats["ax"]
+        print(
+            f"  Final Hypervolume: {ax_stats['final_hv_mean']:.6f} +/- {ax_stats['final_hv_sem']:.6f}"
+        )
 
     print("\n" + "=" * 70)
     print(f"Benchmark complete! Results saved to {args.output_dir}/")

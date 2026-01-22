@@ -35,11 +35,11 @@ Usage:
     # Run only continuous problems
     python bayes_benchmark_synthetic.py --problems continuous
 
-    # Quick test (10 iterations, 3 replications)
-    python bayes_benchmark_synthetic.py --iterations 10 --replications 3
+    # Quick test (10 trials, 3 replications)
+    python bayes_benchmark_synthetic.py --trials 10 --replications 3
 
-    # Standard benchmark (50 iterations, 100 replications)
-    python bayes_benchmark_synthetic.py --iterations 50 --replications 100
+    # Standard benchmark (50 trials, 100 replications)
+    python bayes_benchmark_synthetic.py --trials 50 --replications 100
 
 Output:
     - Results in JSON format: results_{problem_name}.json (one file per problem)
@@ -73,8 +73,8 @@ except ImportError:
     print("Install with: pip install torch")
     sys.exit(1)
 
-# Add parent directory to path to import sweeps
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+# Add path to import sweeps
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from benchmark_problems import (  # noqa: E402
     BaseBenchmarkProblem,
@@ -82,6 +82,7 @@ from benchmark_problems import (  # noqa: E402
     list_available_problems,
     PROBLEM_REGISTRY,
 )
+from benchmark_utils import convert_to_json_serializable  # noqa: E402
 from sweeps.ax_search import ax_search_next_runs  # noqa: E402
 from sweeps.bayes_search import bayes_search_next_runs  # noqa: E402
 from sweeps.run import RunState, SweepRun  # noqa: E402
@@ -90,38 +91,10 @@ from sweeps.run import RunState, SweepRun  # noqa: E402
 warnings.filterwarnings("ignore")
 
 
-def convert_to_json_serializable(obj: Any) -> Any:
-    """Convert numpy types and arrays to native Python types for JSON serialization.
-
-    Args:
-        obj: Object to convert (can be dict, list, numpy array, numpy scalar, etc.)
-
-    Returns:
-        JSON-serializable version of the object
-    """
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, (np.int64, np.int32, np.int16, np.int8)):
-        return int(obj)
-    elif isinstance(obj, (np.float64, np.float32, np.float16)):
-        return float(obj)
-    elif isinstance(obj, np.bool_):
-        return bool(obj)
-    elif isinstance(obj, dict):
-        return {key: convert_to_json_serializable(value) for key, value in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        return [convert_to_json_serializable(item) for item in obj]
-    elif obj is None or isinstance(obj, (bool, int, float, str)):
-        return obj
-    else:
-        # Try to convert to string as fallback
-        return str(obj)
-
-
 def run_optimization_replication(
     problem: BaseBenchmarkProblem,
     method: str,
-    num_iterations: int,
+    num_trials: int,
     random_seed: int = None,
     verbose: bool = False,
 ) -> Dict[str, Any]:
@@ -130,14 +103,14 @@ def run_optimization_replication(
     Args:
         problem: Test problem to optimize
         method: Optimization method ('bayes' or 'ax')
-        num_iterations: Number of optimization iterations
+        num_trials: Number of optimization trials
         random_seed: Random seed for reproducibility
         verbose: Whether to print progress
 
     Returns:
         Dict containing:
-            - 'iterations': List of iteration numbers
-            - 'best_values': List of best values found so far at each iteration
+            - 'trials': List of trial numbers
+            - 'best_values': List of best values found so far at each trial
             - 'values': List of all function values
             - 'final_best': Best value found overall
             - 'final_gap': Gap between final best and known optimum
@@ -158,9 +131,9 @@ def run_optimization_replication(
     best_values = []
     all_values = []
 
-    for iteration in range(num_iterations):
-        if verbose and (iteration + 1) % 10 == 0:
-            print(f"    Iteration {iteration + 1}/{num_iterations}")
+    for trial in range(num_trials):
+        if verbose and (trial + 1) % 10 == 0:
+            print(f"    Trial {trial + 1}/{num_trials}")
 
         try:
             # Generate next suggestion
@@ -196,8 +169,8 @@ def run_optimization_replication(
 
         except Exception as e:
             if verbose:
-                print(f"    Warning: Iteration {iteration} failed with error: {e}")
-            # Use previous best if iteration failed
+                print(f"    Warning: Trial {trial} failed with error: {e}")
+            # Use previous best if trial failed
             if best_values:
                 best_values.append(best_values[-1])
             else:
@@ -216,7 +189,7 @@ def run_optimization_replication(
     final_gap = problem.compute_gap(final_best)
 
     return {
-        "iterations": list(range(len(best_values))),
+        "trials": list(range(len(best_values))),
         "best_values": best_values,
         "values": all_values,
         "final_best": final_best,
@@ -230,7 +203,7 @@ def run_optimization_replication(
 def benchmark_methods_on_problem(
     problem: BaseBenchmarkProblem,
     methods: List[str],
-    num_iterations: int,
+    num_trials: int,
     num_replications: int = 10,
     random_seeds: List[int] = None,
 ) -> Dict[str, List[Dict]]:
@@ -239,7 +212,7 @@ def benchmark_methods_on_problem(
     Args:
         problem: Test problem to benchmark
         methods: List of methods to compare (e.g., ['bayes', 'ax'])
-        num_iterations: Number of optimization iterations per replication
+        num_trials: Number of optimization trials per replication
         num_replications: Number of replications per method (for statistical robustness)
         random_seeds: List of random seeds (defaults to range(num_replications))
 
@@ -261,7 +234,7 @@ def benchmark_methods_on_problem(
             replication_result = run_optimization_replication(
                 problem=problem,
                 method=method,
-                num_iterations=num_iterations,
+                num_trials=num_trials,
                 random_seed=seed,
                 verbose=False,
             )
@@ -416,10 +389,10 @@ def main():
         ),
     )
     parser.add_argument(
-        "--iterations",
+        "--trials",
         type=int,
         default=50,
-        help="Number of optimization iterations per replication",
+        help="Number of optimization trials per replication",
     )
     parser.add_argument(
         "--replications",
@@ -484,7 +457,7 @@ def main():
     print("comparing 'bayes' (sklearn) vs 'ax' (ax-platform)")
     print("=" * 70)
     print(f"Problems: {', '.join([p.name for p in problems])}")
-    print(f"Iterations per replication: {args.iterations}")
+    print(f"Trials per replication: {args.trials}")
     print(f"Replications per method: {args.replications}")
     print(f"Methods: {', '.join(args.methods)}")
     print(f"Output directory: {args.output_dir}")
@@ -516,7 +489,7 @@ def main():
         results = benchmark_methods_on_problem(
             problem=problem,
             methods=args.methods,
-            num_iterations=args.iterations,
+            num_trials=args.trials,
             num_replications=args.replications,
             random_seeds=[args.seed + i for i in range(args.replications)],
         )

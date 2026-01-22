@@ -332,11 +332,16 @@ class MultiObjectiveBoTorchProblem:
             lower, upper = self.bounds[i]
             parameters[f"x{i}"] = {"min": float(lower), "max": float(upper)}
 
-        # Build metrics list for multi-objective
+        # Build metrics list for multi-objective with thresholds
         metrics = []
-        for name in self.objective_names:
+        for i, name in enumerate(self.objective_names):
             # All objectives are minimization (negate=True used in WeldedBeam)
-            metrics.append({"name": name, "goal": "minimize"})
+            # Use reference point as threshold for each objective
+            metrics.append({
+                "name": name,
+                "goal": "minimize",
+                "threshold": self.ref_point[i],
+            })
 
         config = {
             "method": method,

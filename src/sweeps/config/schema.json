@@ -766,12 +766,13 @@
       "description": "The project for this sweep"
     },
     "method": {
-      "description": "Possible values: bayes, random, grid",
+      "description": "Possible values: bayes, random, grid, ax",
       "enum": [
         "bayes",
         "random",
         "grid",
-        "custom"
+        "custom",
+        "ax"
       ]
     },
     "command": {
