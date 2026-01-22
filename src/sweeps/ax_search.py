@@ -242,50 +242,69 @@ def _create_ax_client_from_config(
 
     if is_moo:
         # Multi-objective optimization
-        # Ax Client uses comma-separated objective string for MOO
-        # Format: "-metric1, metric2" (negative for minimize, positive for maximize)
-        objective_parts = []
-        for m in config["metrics"]:
-            if m["goal"] == "minimize":
-                objective_parts.append(f"-{m['name']}")
-            else:  # maximize
-                objective_parts.append(m["name"])
-
-        objective = ", ".join(objective_parts)
-
-        # Get outcome constraints if specified
         outcome_constraints = config.get("metric_constraints")
+        has_thresholds = any(m.get("threshold") is not None for m in config["metrics"])
 
-        client.configure_optimization(
-            objective=objective,
-            outcome_constraints=outcome_constraints,
-        )
+        if has_thresholds:
+            # Build full optimization config with thresholds using official Ax API
+            from ax.core.metric import Metric
+            from ax.core.objective import MultiObjective, Objective
+            from ax.core.optimization_config import MultiObjectiveOptimizationConfig
+            from ax.core.outcome_constraint import ObjectiveThreshold
+            from ax.core.types import ComparisonOp
+            from ax.api.utils.instantiation.from_string import parse_outcome_constraint
 
-        # Set objective thresholds if specified (for hypervolume calculation)
-        # This requires accessing the experiment's optimization config directly
-        if any(m.get("threshold") is not None for m in config["metrics"]):
-            try:
-                from ax.core.optimization_config import MultiObjectiveOptimizationConfig
-                from ax.core.objective import Objective
-                from ax.core.types import TModelPredictArm
+            # Build objectives and thresholds
+            objectives = []
+            objective_thresholds = []
 
-                opt_config = client._experiment.optimization_config
-                if isinstance(opt_config, MultiObjectiveOptimizationConfig):
-                    # Set thresholds on objectives
-                    for m in config["metrics"]:
-                        threshold = m.get("threshold")
-                        if threshold is not None:
-                            metric_name = m["name"]
-                            for obj_threshold in opt_config.objective_thresholds:
-                                if obj_threshold.metric.name == metric_name:
-                                    obj_threshold.bound = threshold
-                                    break
-            except Exception as e:
-                logger.warning(f"Could not set objective thresholds: {e}")
+            for m in config["metrics"]:
+                metric = Metric(name=m["name"])
+                minimize = m["goal"] == "minimize"
+                objectives.append(Objective(metric=metric, minimize=minimize))
+
+                threshold = m.get("threshold")
+                if threshold is not None:
+                    objective_thresholds.append(
+                        ObjectiveThreshold(
+                            metric=metric,
+                            bound=threshold,
+                            relative=False,
+                            op=ComparisonOp.LEQ if minimize else ComparisonOp.GEQ,
+                        )
+                    )
+
+            # Parse outcome constraints from strings
+            parsed_constraints = []
+            if outcome_constraints:
+                for constraint_str in outcome_constraints:
+                    parsed_constraints.append(parse_outcome_constraint(constraint_str))
+
+            # Create optimization config with thresholds
+            opt_config = MultiObjectiveOptimizationConfig(
+                objective=MultiObjective(objectives=objectives),
+                objective_thresholds=objective_thresholds,
+                outcome_constraints=parsed_constraints,
+            )
+            client.set_optimization_config(opt_config)
+        else:
+            # No thresholds - use simple string-based API
+            objective_parts = []
+            for m in config["metrics"]:
+                if m["goal"] == "minimize":
+                    objective_parts.append(f"-{m['name']}")
+                else:
+                    objective_parts.append(m["name"])
+            objective = ", ".join(objective_parts)
+
+            client.configure_optimization(
+                objective=objective,
+                outcome_constraints=outcome_constraints,
+            )
 
         logger.debug(
-            f"Configured Ax experiment with MOO objective: {objective} "
-            f"and {len(outcome_constraints or [])} constraints"
+            f"Configured Ax experiment with MOO and "
+            f"{len(outcome_constraints or [])} constraints"
         )
     else:
         # Single-objective optimization
