@@ -9,20 +9,28 @@ The test uses YAML config files that go through the full parsing path:
 
 This ensures the W&B configuration parsing and validation works correctly.
 
+Two test modes are available:
+  - deterministic: Verifies exact match with same random seeds (default)
+  - statistical: Uses TOST equivalence test for statistical validation
+
 Usage:
-    # Quick sanity check (3 replications)
-    python ax_integration_test.py --problem dtlz2 --trials 20 --replications 3
+    # Deterministic mode: Quick sanity check (5 replications)
+    python ax_integration_test.py --mode deterministic --replications 5
 
-    # Standard test (25 replications)
-    python ax_integration_test.py --problem dtlz2 --trials 20 --replications 25
+    # Deterministic mode: Standard test (25 replications)
+    python ax_integration_test.py --mode deterministic --replications 25
 
-    # Custom configuration
-    python ax_integration_test.py --problem dtlz2 --init 13 --trials 20 \
-        --replications 25
+    # Statistical mode: TOST equivalence test (30 replications recommended)
+    python ax_integration_test.py --mode statistical --replications 30
+
+    # Statistical mode: Custom epsilon and alpha
+    python ax_integration_test.py --mode statistical --replications 30 \
+        --epsilon 0.01 --alpha 0.05
 
 Output:
     - Comparison of hypervolume values between implementations
-    - Verification that results match exactly (with same seed)
+    - Deterministic mode: Verification that results match exactly
+    - Statistical mode: TOST equivalence test with CI and effect size
 """
 
 import argparse
@@ -391,17 +399,97 @@ def compute_paired_statistics(
     }
 
 
+def compute_statistical_equivalence(
+    wandb_hvs: np.ndarray,
+    direct_hvs: np.ndarray,
+    epsilon: float = 0.01,
+    alpha: float = 0.05,
+) -> Dict[str, Any]:
+    """TOST equivalence test for paired hypervolume values.
+
+    Tests whether W&B Ax and Direct Ax produce equivalent results within
+    a specified margin (epsilon). Uses Two One-Sided Tests (TOST) procedure.
+
+    TOST tests the null hypothesis that the methods differ by MORE than epsilon.
+    If we reject this (p < alpha), we conclude the methods are equivalent.
+
+    Args:
+        wandb_hvs: Hypervolume values from W&B Ax replications
+        direct_hvs: Hypervolume values from Direct Ax replications
+        epsilon: Equivalence margin (default 0.01 = 1% hypervolume)
+        alpha: Significance level (default 0.05)
+
+    Returns:
+        Dict containing:
+            - 'tost_p_value': p-value from TOST procedure
+            - 'is_equivalent': True if p < alpha (methods equivalent)
+            - 'mean_diff': Mean paired difference
+            - 'ci_95': 95% confidence interval for the difference
+            - 'cohens_d': Effect size (Cohen's d)
+            - 'se_diff': Standard error of the difference
+    """
+    from scipy import stats
+
+    wandb_arr = np.array(wandb_hvs)
+    direct_arr = np.array(direct_hvs)
+    diff = wandb_arr - direct_arr
+
+    n = len(diff)
+    mean_diff = np.mean(diff)
+    std_diff = np.std(diff, ddof=1)
+    se_diff = std_diff / np.sqrt(n)
+
+    # TOST: Two one-sided t-tests
+    # Test 1: H0: mean_diff >= epsilon vs H1: mean_diff < epsilon
+    # Test 2: H0: mean_diff <= -epsilon vs H1: mean_diff > -epsilon
+    if se_diff > 0:
+        t_upper = (mean_diff - epsilon) / se_diff
+        t_lower = (mean_diff + epsilon) / se_diff
+        p_upper = stats.t.cdf(t_upper, df=n - 1)
+        p_lower = 1 - stats.t.cdf(t_lower, df=n - 1)
+        p_tost = max(p_upper, p_lower)
+    else:
+        # If no variance, check if mean is within bounds
+        p_tost = 0.0 if abs(mean_diff) < epsilon else 1.0
+
+    # Effect size (Cohen's d)
+    cohens_d = mean_diff / std_diff if std_diff > 0 else 0.0
+
+    # 95% CI for the difference
+    t_crit = stats.t.ppf(0.975, df=n - 1)
+    ci_low = mean_diff - t_crit * se_diff
+    ci_high = mean_diff + t_crit * se_diff
+
+    return {
+        "tost_p_value": float(p_tost),
+        "is_equivalent": bool(p_tost < alpha),
+        "mean_diff": float(mean_diff),
+        "ci_95": (float(ci_low), float(ci_high)),
+        "cohens_d": float(cohens_d),
+        "se_diff": float(se_diff),
+        "n": n,
+        "epsilon": epsilon,
+        "alpha": alpha,
+    }
+
+
 def run_integration_test(
     problem_name: str,
     num_init: int,
     num_trials: int,
     num_replications: int,
     base_seed: int = 0,
+    mode: str = "deterministic",
+    epsilon: float = 0.01,
+    alpha: float = 0.05,
 ) -> Tuple[Dict[str, Any], bool]:
     """Run the full integration test.
 
-    With same random seeds, both implementations should produce identical
-    results. This test verifies that the W&B wrapper matches direct Ax.
+    Two modes are supported:
+    - deterministic: With same random seeds, implementations should produce
+      identical results. Verifies exact match.
+    - statistical: Uses TOST equivalence test to verify implementations
+      produce statistically equivalent results within margin epsilon.
 
     Args:
         problem_name: Name of the MOO problem to test
@@ -409,9 +497,12 @@ def run_integration_test(
         num_trials: Total trials per replication
         num_replications: Number of paired replications
         base_seed: Base random seed
+        mode: Test mode ('deterministic' or 'statistical')
+        epsilon: Equivalence margin for statistical mode
+        alpha: Significance level for statistical mode
 
     Returns:
-        Tuple of (results dict, is_equivalent bool)
+        Tuple of (results dict, passed bool)
     """
     # Get problem
     if problem_name not in MOO_PROBLEM_REGISTRY:
@@ -422,12 +513,16 @@ def run_integration_test(
     # Print header
     yaml_path = PROBLEM_YAML_MAP[problem_name]
     print("=" * 70)
-    print("MOO INTEGRATION TEST: W&B Ax (YAML config) vs Direct Ax Client")
+    if mode == "deterministic":
+        print("DETERMINISTIC TEST: W&B Ax vs Direct Ax (exact match)")
+    else:
+        print("STATISTICAL EQUIVALENCE TEST: W&B Ax vs Direct Ax")
     print("=" * 70)
     print(f"Problem: {problem.name} ({problem.dim}D, {problem.num_objectives} objectives)")
     print(f"YAML config: {os.path.basename(yaml_path)}")
-    print(f"Trials: {num_trials}")
-    print(f"Replications: {num_replications}")
+    print(f"Trials: {num_trials}, Replications: {num_replications}")
+    if mode == "statistical":
+        print(f"Epsilon: {epsilon}, Alpha: {alpha}")
     print("=" * 70)
 
     print("\nRunning paired comparisons...")
@@ -448,48 +543,91 @@ def run_integration_test(
         direct_hv = direct_result["final_hypervolume"]
         direct_hvs.append(direct_hv)
 
+        diff = wandb_hv - direct_hv
         print(
             f"  Rep {rep + 1:3d}/{num_replications} (seed={seed:3d})   "
-            f"W&B HV: {wandb_hv:.4f}  Direct HV: {direct_hv:.4f}"
+            f"W&B: {wandb_hv:.4f}  Direct: {direct_hv:.4f}  Diff: {diff:+.6f}"
         )
 
-    # Compute statistics
+    # Compute basic statistics
     stats = compute_paired_statistics(wandb_hvs, direct_hvs)
 
     # Print results
     print("\n" + "=" * 70)
     print("RESULTS")
     print("=" * 70)
-    print(f"W&B Ax mean HV:      {stats['wandb_mean']:.4f} +/- {stats['wandb_std']:.4f}")
-    print(f"Direct Ax mean HV:   {stats['direct_mean']:.4f} +/- {stats['direct_std']:.4f}")
-    print(f"Mean difference:     {stats['mean_diff']:.6f}")
-    print(f"Max abs difference:  {stats['max_abs_diff']:.6f}")
+    print(f"\n{'':24s}{'W&B Ax':>14s}{'Direct Ax':>14s}")
+    print(f"{'Mean HV:':24s}{stats['wandb_mean']:14.4f}{stats['direct_mean']:14.4f}")
+    print(f"{'Std HV:':24s}{stats['wandb_std']:14.4f}{stats['direct_std']:14.4f}")
 
-    # Determine equivalence
-    is_equivalent = stats["all_match"]
+    print(f"\nPaired Difference:")
+    print(f"  Mean:      {stats['mean_diff']:.6f}")
+    print(f"  Max |diff|: {stats['max_abs_diff']:.6f}")
 
-    print("\nCONCLUSION:")
-    if is_equivalent:
-        print("  PASS: All hypervolume values match exactly.")
-        print("  The W&B Sweep API produces identical results to direct Ax.")
+    if mode == "deterministic":
+        # Deterministic mode: check exact match
+        passed = stats["all_match"]
+
+        print("\nCONCLUSION:")
+        if passed:
+            print("  PASS: All hypervolume values match exactly.")
+            print("  The W&B Sweep API produces identical results to direct Ax.")
+        else:
+            print("  FAIL: Differences detected!")
+            print(f"  Max abs difference: {stats['max_abs_diff']:.6f} HV")
+            print("  WARNING: The W&B Sweep API may not match direct Ax behavior!")
+
+        results = {
+            "problem": problem_name,
+            "num_trials": num_trials,
+            "num_replications": num_replications,
+            "mode": mode,
+            "wandb_hvs": wandb_hvs,
+            "direct_hvs": direct_hvs,
+            "statistics": stats,
+            "passed": passed,
+        }
+
     else:
-        print(f"  FAIL: Differences detected!")
-        print(f"  Max abs difference: {stats['max_abs_diff']:.6f} HV")
-        print("  WARNING: The W&B Sweep API may not match direct Ax behavior!")
+        # Statistical mode: TOST equivalence test
+        equiv_stats = compute_statistical_equivalence(
+            wandb_hvs, direct_hvs, epsilon=epsilon, alpha=alpha
+        )
+
+        print(f"  95% CI:    [{equiv_stats['ci_95'][0]:.6f}, {equiv_stats['ci_95'][1]:.6f}]")
+        print(f"  Cohen's d: {equiv_stats['cohens_d']:.4f}")
+        print(f"\nTOST Equivalence Test (epsilon={epsilon}):")
+        print(f"  p-value: {equiv_stats['tost_p_value']:.4f}")
+
+        passed = equiv_stats["is_equivalent"]
+
+        print("\nCONCLUSION:")
+        if passed:
+            print(f"  PASS: Methods equivalent within epsilon={epsilon}")
+            print(f"  (TOST p={equiv_stats['tost_p_value']:.4f} < alpha={alpha})")
+        else:
+            print(f"  FAIL: Cannot conclude equivalence within epsilon={epsilon}")
+            print(f"  (TOST p={equiv_stats['tost_p_value']:.4f} >= alpha={alpha})")
+            if num_replications < 30:
+                print(f"  Note: Consider increasing replications (current: {num_replications})")
+
+        results = {
+            "problem": problem_name,
+            "num_trials": num_trials,
+            "num_replications": num_replications,
+            "mode": mode,
+            "epsilon": epsilon,
+            "alpha": alpha,
+            "wandb_hvs": wandb_hvs,
+            "direct_hvs": direct_hvs,
+            "statistics": stats,
+            "equivalence_stats": equiv_stats,
+            "passed": passed,
+        }
 
     print("=" * 70)
 
-    results = {
-        "problem": problem_name,
-        "num_trials": num_trials,
-        "num_replications": num_replications,
-        "wandb_hvs": wandb_hvs,
-        "direct_hvs": direct_hvs,
-        "statistics": stats,
-        "is_equivalent": is_equivalent,
-    }
-
-    return results, is_equivalent
+    return results, passed
 
 
 def main():
@@ -529,6 +667,26 @@ def main():
         default=0,
         help="Base random seed",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["deterministic", "statistical"],
+        default="deterministic",
+        help="Test mode: 'deterministic' checks exact match with same seeds, "
+        "'statistical' uses TOST equivalence test",
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.01,
+        help="Equivalence margin for statistical mode (default: 0.01 = 1%% HV)",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.05,
+        help="Significance level for statistical mode",
+    )
     args = parser.parse_args()
 
     # Get problem to determine default init
@@ -536,16 +694,19 @@ def main():
     num_init = args.init if args.init is not None else 2 * problem.dim + 1
 
     # Run test
-    results, is_equivalent = run_integration_test(
+    results, passed = run_integration_test(
         problem_name=args.problem,
         num_init=num_init,
         num_trials=args.trials,
         num_replications=args.replications,
         base_seed=args.seed,
+        mode=args.mode,
+        epsilon=args.epsilon,
+        alpha=args.alpha,
     )
 
     # Exit with appropriate code
-    sys.exit(0 if is_equivalent else 1)
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":
