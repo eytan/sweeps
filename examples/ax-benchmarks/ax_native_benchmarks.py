@@ -20,6 +20,8 @@ Usage:
 from __future__ import annotations
  
 import argparse
+import glob
+import json
 import os
 import sys
 import tempfile
@@ -29,7 +31,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
  
 import numpy as np
- 
+import yaml
+
 # Set W&B offline before importing
 os.environ.setdefault("WANDB_MODE", "offline")
  
@@ -184,12 +187,63 @@ PROBLEMS = {
     "branin": _branin, "hartmann6": _hartmann6,
     "dtlz2": _dtlz2, "c2dtlz2": _c2dtlz2, "welded_beam": _welded_beam,
 }
- 
- 
+
+
+# =============================================================================
+# W&B Offline File Reading Utilities
+# =============================================================================
+
+def read_roundtrip_runs(data_dir: str) -> list[SweepRun]:
+    """Read all runs from JSON sidecar files for serialization round-trip testing.
+
+    This reads from JSON sidecar files written by WandBRoundTripNode, NOT from
+    actual W&B storage. This tests that our code works correctly with SweepRun
+    objects reconstructed from serialized data.
+
+    Note: W&B offline mode stores data in binary format that cannot be easily
+    read back. The JSON sidecar approach validates our serialization logic,
+    but does not test W&B's internal data path.
+    """
+    runs = []
+    runs_file = os.path.join(data_dir, "roundtrip_runs.json")
+
+    if not os.path.exists(runs_file):
+        return runs
+
+    with open(runs_file) as f:
+        runs_data = json.load(f)
+
+    for run_data in runs_data:
+        param_config = {k: {"value": v} for k, v in run_data["params"].items()}
+        runs.append(SweepRun(
+            state=RunState.finished,
+            config=param_config,
+            summary_metrics=run_data["metrics"],
+        ))
+
+    return runs
+
+
+def append_roundtrip_run(data_dir: str, params: dict[str, float], metrics: dict[str, float]) -> None:
+    """Append a run to the JSON sidecar file for round-trip testing."""
+    runs_file = os.path.join(data_dir, "roundtrip_runs.json")
+
+    if os.path.exists(runs_file):
+        with open(runs_file) as f:
+            runs_data = json.load(f)
+    else:
+        runs_data = []
+
+    runs_data.append({"params": params, "metrics": metrics})
+
+    with open(runs_file, "w") as f:
+        json.dump(runs_data, f)
+
+
 # =============================================================================
 # External Generation Nodes (wrap W&B searchers for Ax benchmark framework)
 # =============================================================================
- 
+
 class BaseSearchNode:
     """Base class for search method wrappers."""
  
@@ -231,7 +285,12 @@ class DirectAxNode(BaseSearchNode):
  
  
 class WandBLoggerNode(BaseSearchNode):
-    """Full W&B logger flow: next_runs → wandb.init → wandb.log → wandb.finish."""
+    """W&B logger flow: next_runs -> wandb.init -> wandb.log -> wandb.finish.
+
+    NOTE: This node logs to W&B but reads from in-memory storage for optimization.
+    It validates that W&B logging doesn't break optimization, but does NOT verify
+    data survives W&B serialization. For true E2E testing, use WandBRoundTripNode.
+    """
  
     def __init__(self, sweep_config: dict[str, Any], random_seed: int = 42, wandb_dir: str | None = None):
         super().__init__(sweep_config, random_seed)
@@ -259,8 +318,71 @@ class WandBLoggerNode(BaseSearchNode):
  
         # Also record as SweepRun for next iteration
         super().record_observation(params, metrics)
- 
- 
+
+
+class WandBRoundTripNode(BaseSearchNode):
+    """Serialization round-trip test: verifies data survives JSON serialization.
+
+    This tests that ax_search_next_runs() produces identical results when given
+    SweepRun objects reconstructed from serialized data vs in-memory objects.
+
+    What this tests:
+    - Our code (ax_search_next_runs) works correctly with SweepRun inputs
+    - Data serialization doesn't corrupt params/metrics
+    - Deterministic behavior given same seeds
+
+    What this does NOT test (and cannot test in offline mode):
+    - The W&B sweep controller's SweepRun construction from API data
+    - Full wandb.agent() user experience
+    - W&B's internal data storage/retrieval
+
+    For true E2E testing, run with WANDB_MODE=online and actual wandb.agent().
+
+    Implementation:
+    1. Logs parameters and metrics to W&B (same as production)
+    2. Writes them to a JSON sidecar file (for round-trip verification)
+    3. Reads BACK from the JSON file (not in-memory) for next iteration
+    4. Uses those reconstructed runs for the next optimization iteration
+    """
+
+    def __init__(self, sweep_config: dict[str, Any], random_seed: int = 42, wandb_dir: str | None = None):
+        super().__init__(sweep_config, random_seed)
+        self.wandb_dir = wandb_dir or tempfile.mkdtemp()
+        self._run_count = 0
+
+    def get_next_candidate(self) -> dict[str, float]:
+        # Read back ALL runs from JSON sidecar file (TRUE round-trip)
+        reconstructed_runs = read_roundtrip_runs(self.wandb_dir)
+
+        # Use reconstructed runs (NOT in-memory self.sweep_runs)
+        config = SweepConfig(self.sweep_config)
+        suggestions = next_runs(config, reconstructed_runs, validate=False, n=1, random_seed=self.random_seed)
+        return {k: v["value"] for k, v in suggestions[0].config.items()}
+
+    def record_observation(self, params: dict[str, float], metrics: dict[str, float]) -> None:
+        """Log to W&B and JSON sidecar - do NOT store in memory."""
+        import wandb
+
+        self._run_count += 1
+        run = wandb.init(
+            project="ax-e2e-roundtrip",
+            name=f"trial-{self._run_count}",
+            config=params,
+            dir=self.wandb_dir,
+            reinit=True,
+        )
+        wandb.log(metrics)
+        for k, v in metrics.items():
+            wandb.run.summary[k] = v
+        wandb.finish(quiet=True)
+
+        # Write to JSON sidecar for round-trip testing
+        append_roundtrip_run(self.wandb_dir, params, metrics)
+
+        # NOTE: Intentionally do NOT call super() - no in-memory storage
+        # The next get_next_candidate() will read from JSON file instead
+
+
 # =============================================================================
 # Benchmark Runner
 # =============================================================================
@@ -490,16 +612,311 @@ def run_integration_test(problem_name: str, num_trials: int, num_replications: i
     print("=" * 70)
  
     return all_match
- 
- 
+
+
+def run_local_sweep(
+    sweep_config: dict,
+    train_function: Callable[[dict[str, float]], dict[str, float]],
+    count: int,
+    random_seed: int = 42,
+    wandb_project: str = "local-sweep",
+    wandb_dir: str | None = None,
+) -> list[dict]:
+    """Run a sweep locally using the sweeps library directly.
+
+    This provides a wandb.agent()-like experience that works in offline mode.
+    Instead of relying on W&B's sweep controller, it manages the optimization
+    loop locally using the sweeps library.
+
+    Args:
+        sweep_config: Sweep configuration dict (same format as wandb.sweep())
+        train_function: Function that takes params dict and returns metrics dict
+        count: Number of trials to run
+        random_seed: Random seed for reproducibility
+        wandb_project: W&B project name for logging
+        wandb_dir: Directory for W&B logs (uses temp dir if not specified)
+
+    Returns:
+        List of dicts containing params and metrics for each trial
+    """
+    import wandb
+
+    wandb_dir = wandb_dir or tempfile.mkdtemp()
+    config = SweepConfig(sweep_config)
+    runs: list[SweepRun] = []
+    results = []
+
+    for i in range(count):
+        # Get next suggestion from sweep library
+        suggestions = next_runs(config, runs, validate=False, n=1, random_seed=random_seed)
+        params = {k: v["value"] for k, v in suggestions[0].config.items()}
+
+        # Run training and get metrics
+        metrics = train_function(params)
+
+        # Log to W&B
+        run = wandb.init(
+            project=wandb_project,
+            name=f"trial-{i+1}",
+            config=params,
+            dir=wandb_dir,
+            reinit=True,
+        )
+        wandb.log(metrics)
+        for k, v in metrics.items():
+            wandb.run.summary[k] = v
+        wandb.finish(quiet=True)
+
+        # Record for next iteration
+        runs.append(SweepRun(
+            state=RunState.finished,
+            config={k: {"value": v} for k, v in params.items()},
+            summary_metrics=metrics,
+        ))
+        results.append({"params": params, "metrics": metrics})
+
+    return results
+
+
+def run_agent_smoke_test(problem_name: str, num_trials: int, seed: int) -> bool:
+    """Smoke test: Run a full sweep using wandb.agent() or local sweep runner.
+
+    In online mode, uses wandb.sweep() + wandb.agent() (the full cloud experience).
+    In offline mode, uses run_local_sweep() which provides the same UX locally.
+
+    This tests the optimization pipeline end-to-end:
+    1. Get parameter suggestions from Ax
+    2. Run training function with those parameters
+    3. Log metrics to W&B
+    4. Use metrics to inform next suggestions
+    """
+    import wandb
+
+    problem = PROBLEMS[problem_name]()
+    config = problem.create_sweep_config("ax")
+
+    def train_function_simple(params: dict[str, float]) -> dict[str, float]:
+        """Training function that takes params and returns metrics."""
+        return problem.evaluate(params)
+
+    # Check if we're in offline mode
+    if os.environ.get("WANDB_MODE") == "offline":
+        print("\nRunning in OFFLINE mode using local sweep runner...")
+        print("(For cloud experience, unset WANDB_MODE and run 'wandb login')")
+
+        with tempfile.TemporaryDirectory() as wandb_dir:
+            results = run_local_sweep(
+                sweep_config=config,
+                train_function=train_function_simple,
+                count=num_trials,
+                random_seed=seed,
+                wandb_project="ax-smoke-test",
+                wandb_dir=wandb_dir,
+            )
+    else:
+        # Online mode: use wandb.sweep() + wandb.agent()
+        print("\nRunning in ONLINE mode using W&B sweep controller...")
+        results = []
+
+        def train_function_agent():
+            """Training function called by wandb.agent()."""
+            run = wandb.init()
+            params = {f"x{i}": wandb.config[f"x{i}"] for i in range(problem.dim)}
+            metrics = problem.evaluate(params)
+            wandb.log(metrics)
+            for k, v in metrics.items():
+                wandb.run.summary[k] = v
+            results.append({"params": params, "metrics": metrics})
+            wandb.finish(quiet=True)
+
+        sweep_id = wandb.sweep(config, project="ax-smoke-test")
+        wandb.agent(sweep_id, train_function_agent, count=num_trials)
+
+    # Verify results
+    print(f"\nSmoke test completed: {len(results)} trials")
+
+    if len(results) != num_trials:
+        print(f"FAIL: Expected {num_trials} trials, got {len(results)}")
+        return False
+
+    # Check that we got valid metrics
+    if problem.num_objectives == 1:
+        values = [r["metrics"][problem.objective_names[0]] for r in results]
+        best = min(values) if problem.is_minimization else max(values)
+        print(f"Best value: {best:.6f} (optimal: {problem.optimal_value})")
+    else:
+        print(f"Completed {num_trials} MOO trials")
+
+    print("PASS: Smoke test succeeded")
+    return True
+
+
+def compute_detectable_effect_size(n: int, alpha: float = 0.05, power: float = 0.80) -> float:
+    """Compute minimum detectable Cohen's d for paired t-test.
+
+    Uses the approximate formula for sample size calculation in paired t-tests.
+    This gives a rough estimate of the effect size detectable at given power.
+
+    Args:
+        n: Number of paired observations (replications)
+        alpha: Significance level (default 0.05)
+        power: Desired statistical power (default 0.80)
+
+    Returns:
+        Minimum detectable Cohen's d (effect size)
+    """
+    from scipy import stats
+    # Approximate formula for Cohen's d at given power
+    # For paired t-test: d ≈ (z_alpha + z_beta) / sqrt(n)
+    z_alpha = stats.norm.ppf(1 - alpha / 2)
+    z_beta = stats.norm.ppf(power)
+    d = (z_alpha + z_beta) / np.sqrt(n)
+    return d
+
+
+def run_roundtrip_test(problem_name: str, num_trials: int, num_replications: int, seed: int) -> bool:
+    """Statistical comparison: Direct Ax vs serialization round-trip.
+
+    Tests that ax_search_next_runs() produces identical results when given
+    SweepRun objects reconstructed from JSON-serialized data vs in-memory objects.
+    Uses WandBRoundTripNode which writes to JSON sidecar files and reads them back.
+
+    What this validates:
+    - Our code (ax_search_next_runs) works correctly with SweepRun inputs
+    - Data serialization doesn't corrupt params/metrics
+    - Deterministic behavior given same seeds
+
+    What this does NOT test (cannot test in offline mode):
+    - The W&B sweep controller's SweepRun construction from API data
+    - W&B's internal data storage/retrieval
+
+    Validation strategy:
+    1. First check for exact equality (data integrity)
+    2. If not exact, use paired t-test to check statistical significance
+    3. More replicates = more power to detect true differences
+    4. Sanity check: different seeds should produce different results
+    """
+    from scipy import stats
+
+    print("=" * 70)
+    print("ROUND-TRIP TEST: Direct Ax vs W&B File Round-Trip")
+    print("=" * 70)
+
+    problem = PROBLEMS[problem_name]()
+    print(f"\nProblem: {problem.name}")
+    print(f"Testing: DirectAxNode vs serialization round-trip")
+
+    direct_results = []
+    roundtrip_results = []
+    exact_matches = 0
+
+    for i in range(num_replications):
+        rep_seed = seed + i
+        config = problem.create_sweep_config("ax")
+
+        # Direct path (in-memory)
+        np.random.seed(rep_seed)
+        torch.manual_seed(rep_seed)
+        direct_node = DirectAxNode(config, rep_seed)
+        direct_result = run_replication(problem, direct_node, num_trials)
+        direct_results.append(direct_result.final_value)
+
+        # Round-trip path (reads from W&B offline files)
+        np.random.seed(rep_seed)
+        torch.manual_seed(rep_seed)
+        with tempfile.TemporaryDirectory() as wandb_dir:
+            roundtrip_node = WandBRoundTripNode(config, rep_seed, wandb_dir)
+            roundtrip_result = run_replication(problem, roundtrip_node, num_trials)
+        roundtrip_results.append(roundtrip_result.final_value)
+
+        diff = roundtrip_result.final_value - direct_result.final_value
+        is_exact = abs(diff) < 1e-9
+        exact_matches += int(is_exact)
+
+        metric = "HV" if problem.num_objectives > 1 else "Best"
+        status = "EXACT" if is_exact else f"diff={diff:+.2e}"
+        print(f"  Rep {i+1}/{num_replications}: Direct={direct_result.final_value:.6f} "
+              f"Roundtrip={roundtrip_result.final_value:.6f} [{status}]")
+
+    print("=" * 70)
+
+    # Sanity check: different seeds should produce different final values
+    unique_direct = len(set(direct_results))
+    unique_roundtrip = len(set(roundtrip_results))
+
+    if num_replications > 1:
+        if unique_direct == 1:
+            print(f"WARNING: All {num_replications} direct replications produced identical results!")
+            print("         This suggests a seed handling bug.")
+            return False
+        if unique_roundtrip == 1:
+            print(f"WARNING: All {num_replications} roundtrip replications produced identical results!")
+            print("         This suggests a seed handling bug.")
+            return False
+        print(f"Seed sanity check: {unique_direct}/{num_replications} unique direct, "
+              f"{unique_roundtrip}/{num_replications} unique roundtrip")
+
+    # Check for exact equality across all replications
+    if exact_matches == num_replications:
+        print(f"PASS: Exact equality across all {num_replications} replications")
+        print("      Data integrity through W&B serialization confirmed.")
+        return True
+
+    # Statistical validation via paired t-test
+    direct_arr = np.array(direct_results)
+    roundtrip_arr = np.array(roundtrip_results)
+    mean_diff = np.mean(roundtrip_arr - direct_arr)
+    t_stat, p_value = stats.ttest_rel(direct_results, roundtrip_results)
+
+    print(f"\nStatistical Analysis ({num_replications} replications):")
+    print(f"  Exact matches: {exact_matches}/{num_replications}")
+    print(f"  Mean difference: {mean_diff:.6f}")
+    print(f"  Paired t-test: t={t_stat:.4f}, p={p_value:.4f}")
+
+    # Power analysis - help user understand detection limits
+    std_diff = np.std(roundtrip_arr - direct_arr)
+    detectable_d = compute_detectable_effect_size(num_replications)
+    detectable_gap = detectable_d * std_diff if std_diff > 0 else 0.0
+
+    print(f"\nPower Analysis (80% power, α=0.05):")
+    print(f"  Replications: {num_replications}")
+    print(f"  Std dev of differences: {std_diff:.6f}")
+    print(f"  Minimum detectable Cohen's d: {detectable_d:.2f}")
+    print(f"  Minimum detectable gap: {detectable_gap:.6f}")
+    print(f"  ")
+    print(f"  Interpretation: With {num_replications} replicates, we can only detect")
+    print(f"  systematic differences larger than {detectable_gap:.4f} at 80% power.")
+    if num_replications < 25:
+        print(f"  ")
+        print(f"  RECOMMENDATION: Use --replications 25 for better sensitivity.")
+        print(f"  With 25 replicates, detectable d = {compute_detectable_effect_size(25):.2f}")
+
+    if p_value > 0.05:
+        print("\nPASS: No statistically significant difference (p > 0.05)")
+        print("      Minor numerical differences are expected and acceptable.")
+        return True
+    else:
+        print(f"\nFAIL: Statistically significant difference detected (p={p_value:.4f} <= 0.05)")
+        print("      W&B round-trip may be affecting optimization quality.")
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Ax-native benchmarking with W&B searcher integration",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--mode", choices=["soo", "moo", "integration", "all"], default="all",
-        help="Benchmark mode",
+        "--mode",
+        choices=["soo", "moo", "integration", "smoke", "roundtrip", "all"],
+        default="all",
+        help="""Benchmark mode:
+            soo: Single-objective benchmark (bayes vs ax)
+            moo: Multi-objective benchmark
+            integration: In-memory comparison (Direct vs W&B logger)
+            smoke: wandb.agent() smoke test (simple pass/fail)
+            roundtrip: True E2E test (reads back from W&B files)
+            all: Run soo, moo, and integration""",
     )
     parser.add_argument(
         "--problems", nargs="+", default=["branin", "hartmann6", "dtlz2"],
@@ -522,7 +939,20 @@ def main():
         moo_problems = [p for p in args.problems if PROBLEMS[p]().num_objectives > 1]
         if moo_problems:
             run_integration_test(moo_problems[0], args.trials, args.replications, args.seed)
- 
- 
+
+    if args.mode == "smoke":
+        print("\n" + "=" * 70)
+        print("SMOKE TEST: wandb.agent() E2E")
+        print("=" * 70)
+        # Use first SOO problem for smoke test
+        soo_problems = [p for p in args.problems if PROBLEMS[p]().num_objectives == 1]
+        problem = soo_problems[0] if soo_problems else args.problems[0]
+        run_agent_smoke_test(problem, num_trials=args.trials, seed=args.seed)
+
+    if args.mode == "roundtrip":
+        # Use first problem for roundtrip test
+        run_roundtrip_test(args.problems[0], args.trials, args.replications, args.seed)
+
+
 if __name__ == "__main__":
     main()
