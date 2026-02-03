@@ -220,9 +220,18 @@ def next_runs(
         return bayes_search_next_runs(
             runs, sweep_config, validate=validate, n=n, **kwargs
         )
+    elif method == "ax":
+        try:
+            from .ax_search import ax_search_next_runs
+        except ImportError as e:
+            raise ImportError(
+                f"The '{method}' search method requires optional dependencies. "
+                "Install them with: pip install sweeps[ax]"
+            ) from e
+        return ax_search_next_runs(runs, sweep_config, validate=validate, n=n, **kwargs)
     else:
         raise ValueError(
-            f'Invalid search type {method}, must be one of ["grid", "random", "bayes"]'
+            f'Invalid search type {method}, must be one of ["grid", "random", "bayes", "ax"]'
         )
 
 
