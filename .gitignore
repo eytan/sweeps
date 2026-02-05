@@ -136,3 +136,7 @@ test_results/
 prof/
 result.xml
 wandb/
+
+# Ax benchmark outputs
+benchmark_results/
+data/

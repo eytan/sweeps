@@ -1,0 +1,17 @@
+# Branin 2D Single-Objective Optimization Sweep Config
+# 1 objective (value), optimal value ~0.397887
+
+method: ax
+name: Branin_2D
+
+metric:
+  name: value
+  goal: minimize
+
+parameters:
+  x0:
+    min: -5.0
+    max: 10.0
+  x1:
+    min: 0.0
+    max: 15.0
